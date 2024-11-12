@@ -193,8 +193,9 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = CastedLinear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj  = CastedLinear(4 * config.n_embd, config.n_embd, bias=False)
+        hidden_dim = config.n_embd * 43/16 # 11008/4096
+        self.c_fc    = CastedLinear(config.n_embd, hidden_dim, bias=False)
+        self.c_proj  = CastedLinear(hidden_dim, config.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x):
