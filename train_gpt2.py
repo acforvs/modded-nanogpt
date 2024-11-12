@@ -226,7 +226,7 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        hidden_dim = int(8/3 * config.n_embd)
+        hidden_dim = int(4 * config.n_embd)
         self.c_fc = CastedLinear(config.n_embd, hidden_dim, bias=False)
         self.c_proj = CastedLinear(hidden_dim, config.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
