@@ -6,6 +6,7 @@ import uuid
 import glob
 import time
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -41,8 +42,8 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
         X = X.T
     for _ in range(steps):
         A = X @ X.T
-        B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
-        X = a * X + B @ X
+        B = A @ X
+        X = a * X + b * B + c * A @ B
     if G.size(0) > G.size(1):
         X = X.T
     return X
@@ -74,74 +75,107 @@ class Muon(torch.optim.Optimizer):
         backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
         backend_steps: The number of iteration steps to use in the backend, if it is iterative.
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
-                 backend='newtonschulz5', backend_steps=5):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, backend='newtonschulz5', backend_steps=5):
+        defaults = dict(lr=lr, momentum=momentum, backend=backend,
+                       backend_steps=backend_steps, nesterov=nesterov)
         super().__init__(params, defaults)
 
+        self.world_size = int(os.environ['WORLD_SIZE'])
+        self.rank = int(os.environ['RANK'])
+
+        self.stream = torch.cuda.Stream()
+
+        max_size = max(sum(p.numel() for p in group['params']) for group in self.param_groups)
+
+        self.updates_buffer = torch.zeros(max_size, device='cuda', dtype=torch.bfloat16)
+
     def step(self):
+      with torch.cuda.stream(self.stream):
 
-        for group in self.param_groups:
+          for group in self.param_groups:
+              lr = group['lr']
+              momentum = group['momentum']
+              nesterov = group['nesterov']
+              zeropower_backend = zeropower_backends[group['backend']]
+              backend_steps = group['backend_steps']
 
-            lr = group['lr']
-            momentum = group['momentum']
-            zeropower_backend = zeropower_backends[group['backend']]
+              total_params = sum(p.numel() for p in group['params'])
+              updates_flat = self.updates_buffer[:total_params].zero_()
 
-            # generate weight updates in distributed fashion
-            total_params = sum(p.numel() for p in group['params'])
-            updates_flat = torch.zeros(total_params, device='cuda', dtype=torch.bfloat16)
-            curr_idx = 0
-            for i, p in enumerate(group['params']):
-                # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
-                if i % int(os.environ['WORLD_SIZE']) == int(os.environ['RANK']):
-                    g = p.grad
-                    assert g is not None
-                    state = self.state[p]
-                    if 'momentum_buffer' not in state:
-                        state['momentum_buffer'] = torch.zeros_like(g)
-                    buf = state['momentum_buffer']
-                    buf.mul_(momentum).add_(g)
-                    if group['nesterov']:
-                        g = g.add(buf, alpha=momentum)
-                    g = zeropower_backend(g, steps=group['backend_steps'])
-                    g *= max(1, g.size(0)/g.size(1))**0.5
-                    updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
-                curr_idx += p.numel()
+              curr_idx = 0
 
-            # sync updates across devices. we are not memory-constrained so can do this simple deserialization
-            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+              parameters, gradients = [], []
+              buffers, inds = [], []
 
-            # deserialize and apply updates
-            curr_idx = 0
-            for p in group['params']:
-                g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
-                p.data.add_(g, alpha=-lr)
-                curr_idx += p.numel()
+              for i, p in enumerate(group['params']):
+                  if i % self.world_size == self.rank and p.grad is not None:
+                      parameters.append(p)
+                      gradients.append(p.grad)
+
+                      state = self.state[p]
+                      if 'momentum_buffer' not in state:
+                          state['momentum_buffer'] = torch.zeros_like(p.grad)
+                      buffers.append(state['momentum_buffer'])
+                      inds.append(curr_idx)
+                  curr_idx += p.numel()
+
+              if parameters:
+                  torch._foreach_mul_(buffers, momentum)
+                  torch._foreach_add_(buffers, gradients)
+
+                  if nesterov:
+                      gradients = torch._foreach_add(gradients, buffers, alpha=momentum)
+
+                  for g, idx in zip(gradients, inds):
+                      processed_g = zeropower_backend(g, steps=backend_steps)
+                      processed_g *= max(1, g.size(0)/g.size(1))**0.5
+                      updates_flat[idx:idx + g.numel()].copy_(processed_g.flatten())
+
+              future = dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM, async_op=True)
+
+              param_views = []
+              curr_idx = 0
+              for p in group['params']:
+                  numel = p.numel()
+                  param_views.append((
+                      p,
+                      updates_flat[curr_idx:curr_idx + numel].view_as(p.data)
+                  ))
+                  curr_idx += numel
+
+              future.wait()
+
+              for p, view in param_views:
+                  p.data.add_(view.to(p.dtype), alpha=-lr)
+
+              self.stream.synchronize()
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
 
 class Rotary(torch.nn.Module):
-
-    def __init__(self, dim, base=10000):
+    def __init__(self, dim, base=10000, max_seq_len=1024):
         super().__init__()
         self.dim = dim
-        self.base = base
-        self.inv_freq = None
-        self.seq_len_cached = None
-        self.cos_cached = None
-        self.sin_cached = None
+
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq)
+
+        pos = torch.arange(max_seq_len)
+        freqs = torch.outer(pos, self.inv_freq)
+
+        cos = freqs.cos().bfloat16()
+        sin = freqs.sin().bfloat16()
+
+        self.register_buffer('cos_cached', cos.unsqueeze(0).unsqueeze(2))
+        self.register_buffer('sin_cached', sin.unsqueeze(0).unsqueeze(2))
 
     def forward(self, x):
         seq_len = x.shape[1]
-        if seq_len != self.seq_len_cached:
-            self.inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, device=x.device).float() / self.dim))
-            self.seq_len_cached = seq_len
-            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
-            freqs = torch.outer(t, self.inv_freq)
-            self.cos_cached = freqs.cos().bfloat16()
-            self.sin_cached = freqs.sin().bfloat16()
-        return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
+        return (
+            self.cos_cached[:, :seq_len],
+            self.sin_cached[:, :seq_len]
+        )
 
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4 # multihead attention
@@ -164,9 +198,8 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
-        self.c_q = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        self.c_k = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        self.c_v = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_qkv = CastedLinear(self.n_embd, 3 * self.n_embd, bias=False)
+
         # output projection
         self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
@@ -175,9 +208,9 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x, v1=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
+        qkv = self.c_qkv(x).view(B, T, 3, self.n_head, self.head_dim)
+        q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+
         if v1 is None:
             v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
         v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
@@ -190,11 +223,11 @@ class CausalSelfAttention(nn.Module):
         return y, v1
 
 class MLP(nn.Module):
-
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = CastedLinear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj  = CastedLinear(4 * config.n_embd, config.n_embd, bias=False)
+        hidden_dim   = int(config.n_embd * 8/3)
+        self.c_fc    = CastedLinear(config.n_embd, hidden_dim, bias=False)
+        self.c_proj  = CastedLinear(hidden_dim, config.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x):
@@ -204,7 +237,6 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-
     def __init__(self, config):
         super().__init__()
         self.attn = CausalSelfAttention(config)
@@ -238,6 +270,14 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
+
+        self.num_layers = config.n_layer
+        self.encoder_layers = self.num_layers // 2  # Half of the layers for encoder
+        self.decoder_layers = self.num_layers - self.encoder_layers  # Remaining for decoder
+        
+        # Add learnable skip connection weights for decoder layers
+        self.skip_weights = nn.Parameter(torch.ones(self.decoder_layers))
+
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
@@ -248,8 +288,23 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),)) # @Grad62304977
         x0 = x
         v1 = None
-        for block in self.transformer.h:
-            x, v1 = block(x, v1, x0)
+
+        # Store outputs for U-Net skip connections
+        skip_connections = []
+        
+        # Encoder pass - process only the first half of the blocks
+        for i in range(self.encoder_layers):
+            x, v1 = self.transformer.h[i](x, v1, x0)
+            skip_connections.append(x)  # Store the output for skip connections
+        
+        # Decoder pass - process the remaining blocks with weighted skip connections
+        for i in range(self.decoder_layers):
+            skip_connection = skip_connections.pop()  # Get the corresponding encoder output
+            # Apply learnable weight to skip connection
+            weighted_skip = self.skip_weights[i] * skip_connection
+            x, v1 = self.transformer.h[self.encoder_layers + i](x + weighted_skip, v1, x0)
+        
+
         x = F.rms_norm(x, (x.size(-1),))
 
         logits = self.lm_head(x)
@@ -276,17 +331,12 @@ def _peek_data_shard(filename):
     ntok = header[2] # number of tokens (claimed)
     return ntok # for now just return the number of tokens
 
-def _load_data_shard(filename):
-    with open(filename, "rb") as f:
-        # first read the header, which is 256 int32 integers (4 bytes each)
-        header = np.frombuffer(f.read(256*4), dtype=np.int32)
-        assert header[0] == 20240520, "magic number mismatch in the data .bin file"
-        assert header[1] == 1, "unsupported version"
-        ntok = header[2] # number of tokens (claimed)
-        # the rest of it are tokens, stored as uint16
-        tokens = np.frombuffer(f.read(), dtype=np.uint16)
-    assert len(tokens) == ntok, "number of tokens read does not match header?"
-    return tokens
+def _load_data_shard_mmap(filename):
+    f = np.memmap(filename, dtype='uint16', mode='r', offset=1024)
+    header = np.memmap(filename, dtype='int32', mode='r', shape=(256,))
+    assert header[0] == 20240520, "magic number mismatch"
+    assert header[1] == 1, "unsupported version"
+    return f
 
 class DistributedDataLoader:
     def __init__(self, filename_pattern, B, T, process_rank, num_processes):
@@ -294,44 +344,42 @@ class DistributedDataLoader:
         self.num_processes = num_processes
         self.B = B
         self.T = T
-
-        # glob files that match the pattern
         self.files = sorted(glob.glob(filename_pattern))
         assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
 
-        # load and validate all data shards, count number of tokens in total
-        ntok_total = 0
-        for fname in self.files:
-            shard_ntok = _peek_data_shard(fname)
-            assert shard_ntok >= num_processes * B * T + 1
-            ntok_total += int(shard_ntok)
-        self.ntok_total = ntok_total
-
-        # kick things off
+        self.executor = ThreadPoolExecutor(max_workers=1)
+        self.ntok_total = sum(_peek_data_shard(f) for f in self.files)
         self.reset()
 
     def reset(self):
         self.current_shard = 0
         self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard])
+        self.tokens = _load_data_shard_mmap(self.files[self.current_shard])
+        self._prefetch_next()
 
-    def advance(self): # advance to next data shard
+    def _prefetch_next(self):
+        self.future = self.executor.submit(_load_data_shard_mmap, self.files[self.current_shard])
+
+    def advance(self):
+        self.tokens = self.future.result()
         self.current_shard = (self.current_shard + 1) % len(self.files)
         self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard])
+        self._prefetch_next()
 
     def next_batch(self):
-        B = self.B
-        T = self.T
-        buf = self.tokens[self.current_position : self.current_position+B*T+1]
-        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
-        x = (buf[:-1]).view(B, T) # inputs
-        y = (buf[1:]).view(B, T) # targets
-        # advance current position and load next shard if necessary
+        B, T = self.B, self.T
+        buf = torch.tensor(
+            self.tokens[self.current_position : self.current_position + B * T + 1].astype(np.int32), dtype=torch.long
+        ).cuda(non_blocking=True)
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
+
         self.current_position += B * T * self.num_processes
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.advance()
-        return x.cuda(), y.cuda()
+
+        return x, y
+
 
 # -----------------------------------------------------------------------------
 # int main
@@ -345,9 +393,9 @@ class Hyperparameters:
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 3242 # number of iterations to run
+    num_iterations : int = 3500 # number of iterations to run
     warmup_iters : int = 0
-    warmdown_iters : int = 926 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    warmdown_iters : int = 900 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -366,33 +414,6 @@ torch.cuda.set_device(device)
 print(f"using device: {device}")
 master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
 
-# begin logging
-logfile = None
-if master_process:
-    run_id = str(uuid.uuid4())
-    logdir = 'logs/%s/' % run_id
-    os.makedirs(logdir, exist_ok=True)
-    logfile = 'logs/%s.txt' % run_id
-    # create the log file
-    with open(logfile, "w") as f:
-        # begin the log by printing this file (the Python code)
-        f.write('='*100 + '\n')
-        f.write(code)
-        f.write('='*100 + '\n')
-def print0(s, logonly=False):
-    if master_process:
-        with open(logfile, "a") as f:
-            if not logonly:
-                print(s)
-            f.write(s+'\n')
-# log information about the hardware/software environment this is running on
-# and print the full `nvidia-smi` to file
-print0(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:")
-import subprocess
-result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-print0(f'{result.stdout}', logonly=True)
-print0('='*100, logonly=True)
-
 # convenience variables
 B, T = args.device_batch_size, args.sequence_length
 # calculate the number of steps to take in the val loop.
@@ -405,9 +426,9 @@ train_accumulation_steps = args.batch_size // (B * ddp_world_size)
 # load tokens
 train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
 val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
-print0(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
-print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
-print0('='*100, logonly=True)
+if master_process:
+    print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
+    print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
 x, y = train_loader.next_batch()
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
@@ -418,6 +439,7 @@ model = model.cuda().bfloat16()
 for m in model.modules():
     if isinstance(m, CastedLinear):
         m.float()
+
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
@@ -433,13 +455,13 @@ enable_mem_efficient_sdp(False)
 enable_math_sdp(False)
 
 # init the optimizer(s)
-optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.3,   betas=(0.9, 0.95), fused=True)
-optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.002, betas=(0.9, 0.95), fused=True)
+optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.6,   betas=(0.9, 0.95), fused=True)
+optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.008, betas=(0.9, 0.95), fused=True)
 params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2]
-optimizer3 = Muon(matrix_params, lr=0.02, momentum=0.95)
-optimizer4 = torch.optim.Adam(scalar_params, lr=0.02, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
+optimizer3 = Muon(matrix_params, lr=0.04,  momentum=0.95)
+optimizer4 = torch.optim.Adam(list(scalar_params) + [raw_model.skip_weights], lr=0.04, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
@@ -456,7 +478,26 @@ def get_lr(it):
         return decay_ratio
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
-# Start training loop
+# begin logging
+if master_process:
+    run_id = str(uuid.uuid4())
+    logdir = 'logs/%s/' % run_id
+    os.makedirs(logdir, exist_ok=True)
+    logfile = 'logs/%s.txt' % run_id
+    # create the log file
+    with open(logfile, "w") as f:
+        # begin the log by printing this file (the Python code)
+        f.write('='*100 + '\n')
+        f.write(code)
+        f.write('='*100 + '\n')
+        # log information about the hardware/software environment this is running on
+        # and print the full `nvidia-smi` to file
+        f.write(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:\n")
+        import subprocess
+        result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        f.write(f'{result.stdout}\n')
+        f.write('='*100 + '\n')
+
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -489,7 +530,10 @@ for step in range(args.num_iterations + 1):
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         # log val loss to console and to logfile
-        print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+        if master_process:
+            print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+            with open(logfile, "a") as f:
+                f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -541,8 +585,11 @@ for step in range(args.num_iterations + 1):
     # everything that follows now is just diagnostics, prints, logging, etc.
 
     #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
-    approx_time = training_time_ms + 1000 * (time.time() - t0)
-    print0(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+    if master_process:
+        approx_time = training_time_ms + 1000 * (time.time() - t0)
+        print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+        with open(logfile, "a") as f:
+            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
