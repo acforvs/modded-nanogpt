@@ -154,7 +154,7 @@ class Muon(torch.optim.Optimizer):
 # PyTorch nn.Module definitions for the GPT-2 model
 
 class Rotary(torch.nn.Module):
-    def __init__(self, dim, base=10000, max_seq_len=1024):
+    def __init__(self, dim, base=10000, max_seq_len=2048):
         super().__init__()
         self.dim = dim
 
@@ -173,8 +173,8 @@ class Rotary(torch.nn.Module):
     def forward(self, x):
         seq_len = x.shape[1]
         return (
-            self.cos_cached[:, :seq_len],
-            self.sin_cached[:, :seq_len]
+            self.cos_cached[:, :seq_len, :, :seq_len],
+            self.sin_cached[:, :seq_len, :, :seq_len]
         )
 
 def apply_rotary_emb(x, cos, sin):
@@ -225,7 +225,7 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        hidden_dim   = int(config.n_embd * 8/3)
+        hidden_dim   = int(config.n_embd * 11008/4096)
         self.c_fc    = CastedLinear(config.n_embd, hidden_dim, bias=False)
         self.c_proj  = CastedLinear(hidden_dim, config.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
@@ -460,7 +460,7 @@ optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.008, beta
 params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2]
-optimizer3 = Muon(matrix_params, lr=0.04,  momentum=0.95)
+optimizer3 = Muon(matrix_params, lr=0.02,  momentum=0.95)
 optimizer4 = torch.optim.Adam(list(scalar_params) + [raw_model.skip_weights], lr=0.04, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and warmdown)
