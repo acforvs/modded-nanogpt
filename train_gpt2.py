@@ -172,7 +172,7 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
-        self.rotary = Rotary(self.head_dim, config.m)
+        self.rotary = Rotary(self.head_dim)
         self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
 
     def forward(self, x, v1=None):
