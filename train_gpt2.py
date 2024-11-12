@@ -6,6 +6,7 @@ import uuid
 import glob
 import time
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -276,17 +277,12 @@ def _peek_data_shard(filename):
     ntok = header[2] # number of tokens (claimed)
     return ntok # for now just return the number of tokens
 
-def _load_data_shard(filename):
-    with open(filename, "rb") as f:
-        # first read the header, which is 256 int32 integers (4 bytes each)
-        header = np.frombuffer(f.read(256*4), dtype=np.int32)
-        assert header[0] == 20240520, "magic number mismatch in the data .bin file"
-        assert header[1] == 1, "unsupported version"
-        ntok = header[2] # number of tokens (claimed)
-        # the rest of it are tokens, stored as uint16
-        tokens = np.frombuffer(f.read(), dtype=np.uint16)
-    assert len(tokens) == ntok, "number of tokens read does not match header?"
-    return tokens
+def _load_data_shard_mmap(filename):
+    f = np.memmap(filename, dtype='uint16', mode='r', offset=1024)
+    header = np.memmap(filename, dtype='int32', mode='r', shape=(256,))
+    assert header[0] == 20240520, "magic number mismatch"
+    assert header[1] == 1, "unsupported version"
+    return f
 
 class DistributedDataLoader:
     def __init__(self, filename_pattern, B, T, process_rank, num_processes):
@@ -294,44 +290,40 @@ class DistributedDataLoader:
         self.num_processes = num_processes
         self.B = B
         self.T = T
-
-        # glob files that match the pattern
         self.files = sorted(glob.glob(filename_pattern))
         assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
 
-        # load and validate all data shards, count number of tokens in total
-        ntok_total = 0
-        for fname in self.files:
-            shard_ntok = _peek_data_shard(fname)
-            assert shard_ntok >= num_processes * B * T + 1
-            ntok_total += int(shard_ntok)
-        self.ntok_total = ntok_total
-
-        # kick things off
+        self.executor = ThreadPoolExecutor(max_workers=1)
+        self.ntok_total = sum(_peek_data_shard(f) for f in self.files)
         self.reset()
 
     def reset(self):
         self.current_shard = 0
         self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard])
+        self.tokens = _load_data_shard_mmap(self.files[self.current_shard])
+        self._prefetch_next()
 
-    def advance(self): # advance to next data shard
-        self.current_shard = (self.current_shard + 1) % len(self.files)
+    def _prefetch_next(self):
+        self.future = self.executor.submit(_load_data_shard_mmap, self.files[self.current_shard])
+
+    def advance(self):
+        self.tokens = self.future.result()
         self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard])
+        self._prefetch_next()
 
     def next_batch(self):
-        B = self.B
-        T = self.T
-        buf = self.tokens[self.current_position : self.current_position+B*T+1]
-        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
-        x = (buf[:-1]).view(B, T) # inputs
-        y = (buf[1:]).view(B, T) # targets
-        # advance current position and load next shard if necessary
+        B, T = self.B, self.T
+        buf = torch.tensor(
+            self.tokens[self.current_position : self.current_position + B * T + 1].astype(np.int32), dtype=torch.long
+        ).cuda(non_blocking=True)
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
+
         self.current_position += B * T * self.num_processes
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.advance()
-        return x.cuda(), y.cuda()
+
+        return x, y
 
 # -----------------------------------------------------------------------------
 # int main
