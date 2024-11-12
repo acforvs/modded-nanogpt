@@ -6,11 +6,12 @@ import uuid
 import glob
 import time
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
 from torch import nn
+import torch.profiler
+from torch.profiler import profile, record_function, ProfilerActivity
 import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
@@ -294,12 +295,17 @@ def _peek_data_shard(filename):
     ntok = header[2] # number of tokens (claimed)
     return ntok # for now just return the number of tokens
 
-def _load_data_shard_mmap(filename):
-    f = np.memmap(filename, dtype='uint16', mode='r', offset=1024)
-    header = np.memmap(filename, dtype='int32', mode='r', shape=(256,))
-    assert header[0] == 20240520, "magic number mismatch"
-    assert header[1] == 1, "unsupported version"
-    return f
+def _load_data_shard(filename):
+    with open(filename, "rb") as f:
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+        assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+        assert header[1] == 1, "unsupported version"
+        ntok = header[2] # number of tokens (claimed)
+        # the rest of it are tokens, stored as uint16
+        tokens = np.frombuffer(f.read(), dtype=np.uint16)
+    assert len(tokens) == ntok, "number of tokens read does not match header?"
+    return tokens
 
 class DistributedDataLoader:
     def __init__(self, filename_pattern, B, T, process_rank, num_processes):
@@ -307,41 +313,44 @@ class DistributedDataLoader:
         self.num_processes = num_processes
         self.B = B
         self.T = T
+
+        # glob files that match the pattern
         self.files = sorted(glob.glob(filename_pattern))
         assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
 
-        self.executor = ThreadPoolExecutor(max_workers=1)
-        self.ntok_total = sum(_peek_data_shard(f) for f in self.files)
+        # load and validate all data shards, count number of tokens in total
+        ntok_total = 0
+        for fname in self.files:
+            shard_ntok = _peek_data_shard(fname)
+            assert shard_ntok >= num_processes * B * T + 1
+            ntok_total += int(shard_ntok)
+        self.ntok_total = ntok_total
+
+        # kick things off
         self.reset()
 
     def reset(self):
         self.current_shard = 0
         self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard_mmap(self.files[self.current_shard])
-        self._prefetch_next()
+        self.tokens = _load_data_shard(self.files[self.current_shard])
 
-    def _prefetch_next(self):
-        self.future = self.executor.submit(_load_data_shard_mmap, self.files[self.current_shard])
-
-    def advance(self):
-        self.tokens = self.future.result()
+    def advance(self): # advance to next data shard
         self.current_shard = (self.current_shard + 1) % len(self.files)
         self.current_position = self.process_rank * self.B * self.T
-        self._prefetch_next()
+        self.tokens = _load_data_shard(self.files[self.current_shard])
 
     def next_batch(self):
-        B, T = self.B, self.T
-        buf = torch.tensor(
-            self.tokens[self.current_position : self.current_position + B * T + 1].astype(np.int32), dtype=torch.long
-        ).cuda(non_blocking=True)
-        x = buf[:-1].view(B, T)
-        y = buf[1:].view(B, T)
-
+        B = self.B
+        T = self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
+        # advance current position and load next shard if necessary
         self.current_position += B * T * self.num_processes
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.advance()
-
-        return x, y
+        return x.cuda(), y.cuda()
 
 # -----------------------------------------------------------------------------
 # int main
@@ -355,7 +364,7 @@ class Hyperparameters:
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 3500 # number of iterations to run
+    num_iterations : int = 3000 # number of iterations to run
     warmup_iters : int = 0
     warmdown_iters : int = 900 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
@@ -460,6 +469,25 @@ if master_process:
         f.write(f'{result.stdout}\n')
         f.write('='*100 + '\n')
 
+
+def get_profiler(logdir="./logs/profiler"):
+    return torch.profiler.profile(
+        activities=[
+            ProfilerActivity.CPU,
+            ProfilerActivity.CUDA,
+        ],
+        schedule=torch.profiler.schedule(
+            wait=1,
+            warmup=1,
+            active=5,
+            repeat=1
+        ),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(logdir),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True
+    )
+
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -519,30 +547,43 @@ for step in range(args.num_iterations + 1):
         break
 
     # --------------- TRAINING SECTION BEGIN -----------------
-    model.train()
-    for i in range(1, train_accumulation_steps+1):
-        # forward pass
-        loss = model(x, y)
-        train_loss = loss.detach()
-        # advance the dataset for the next batch
-        x, y = train_loader.next_batch()
-        # backward pass
-        if i < train_accumulation_steps:
-            with model.no_sync(): # there's no need to sync gradients every accumulation step
-                loss.backward()
-        else:
-            loss.backward() # just sync on the last step
-    for p in model.parameters():
-        p.grad /= train_accumulation_steps
+    with get_profiler() as prof:
+        model.train()
+        for i in range(1, train_accumulation_steps+1):
+            # forward pass
+            with record_function("forward"):
+                loss = model(x, y)
+                train_loss = loss.detach()
+            # advance the dataset for the next batch
+            with record_function("data_loading"):
+                x, y = train_loader.next_batch()
+
+            # backward pass
+            with record_function("backward"):
+                if i < train_accumulation_steps:
+                    with model.no_sync(): # there's no need to sync gradients every accumulation step
+                        loss.backward()
+                else:
+                    loss.backward() # just sync on the last step
+        
+        with record_function("grad_norm"):
+            for p in model.parameters():
+                p.grad /= train_accumulation_steps
+
     # momentum warmup for Muon
-    frac = min(step/500, 1)
-    optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+    with record_function("momentum_update"):
+        frac = min(step/500, 1)
+        optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+
     # step the optimizers and schedulers
-    for opt, sched in zip(optimizers, schedulers):
-        opt.step()
-        sched.step()
+    with record_function("optimizer_step"):
+        for opt, sched in zip(optimizers, schedulers):
+            opt.step()
+            sched.step()
+
     # null the gradients
-    model.zero_grad(set_to_none=True)
+    with record_function("zero_grad"):
+        model.zero_grad(set_to_none=True)
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
 
@@ -552,6 +593,12 @@ for step in range(args.num_iterations + 1):
         print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
         with open(logfile, "a") as f:
             f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+
+        with open(logfile, "a") as f:
+            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+            f.write(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+
+        prof.step()
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
