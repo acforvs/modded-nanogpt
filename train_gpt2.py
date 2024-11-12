@@ -14,6 +14,9 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.nn.attention.flex_attention import flex_attention
+
+flex_attention_comp = torch.compile(flex_attention, dynamic=False)
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -120,41 +123,18 @@ class Muon(torch.optim.Optimizer):
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
-
-class Rotary(torch.nn.Module):
-
-    def __init__(self, dim, base=10000):
-        super().__init__()
-        self.dim = dim
-        self.base = base
-        self.inv_freq = None
-        self.seq_len_cached = None
-        self.cos_cached = None
-        self.sin_cached = None
-
-    def forward(self, x):
-        seq_len = x.shape[1]
-        if seq_len != self.seq_len_cached:
-            self.inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, device=x.device).float() / self.dim))
-            self.seq_len_cached = seq_len
-            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
-            freqs = torch.outer(t, self.inv_freq)
-            self.cos_cached = freqs.cos().bfloat16()
-            self.sin_cached = freqs.sin().bfloat16()
-        return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
-
-def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 4 # multihead attention
-    d = x.shape[3]//2
-    x1 = x[..., :d]
-    x2 = x[..., d:]
-    y1 = x1 * cos + x2 * sin
-    y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3).type_as(x)
-
 class CastedLinear(nn.Linear):
     def forward(self, x):
         return F.linear(x, self.weight.to(x.dtype))
+
+
+def generate_alibi_bias(H: int):
+    def alibi_mod(score, b, h, q_idx, kv_idx):
+        scale = torch.exp2(-((h + 1) * 8.0 / H))
+        bias = (q_idx - kv_idx) * scale
+        return score + bias
+
+    return alibi_mod
 
 class CausalSelfAttention(nn.Module):
 
@@ -164,33 +144,34 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
-        self.c_q = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        self.c_k = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        self.c_v = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_qkv = CastedLinear(self.n_embd, 3 * self.n_embd, bias=False)
+
         # output projection
         self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
-        self.rotary = Rotary(self.head_dim)
+
         self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
 
-    def forward(self, x, v1=None):
+    def forward(self, x, check=True):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
-        if v1 is None:
-            v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
-        v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
-        cos, sin = self.rotary(q)
+        qkv = self.c_qkv(x).view(B, T, 3, self.n_head, self.head_dim)
+        q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+
         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+
+        alibi_bias = generate_alibi_bias(self.n_head)
+        y = flex_attention(
+            query=q.transpose(1, 2), 
+            key=k.transpose(1, 2), 
+            value=v.transpose(1, 2), 
+            score_mod=alibi_bias, 
+        )
+
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
-        return y, v1
+        return y
 
 class MLP(nn.Module):
-
     def __init__(self, config):
         super().__init__()
         self.c_fc    = CastedLinear(config.n_embd, 4 * config.n_embd, bias=False)
@@ -211,12 +192,11 @@ class Block(nn.Module):
         self.mlp = MLP(config)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-    def forward(self, x, v1, x0):
+    def forward(self, x, x0):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x1, v1 = self.attn(F.rms_norm(x, (x.size(-1),)), v1)
-        x = x + x1
+        x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
         x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
-        return x, v1
+        return x
 
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
@@ -247,9 +227,8 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         x = F.rms_norm(x, (x.size(-1),)) # @Grad62304977
         x0 = x
-        v1 = None
         for block in self.transformer.h:
-            x, v1 = block(x, v1, x0)
+            x = block(x, x0)
         x = F.rms_norm(x, (x.size(-1),))
 
         logits = self.lm_head(x)
