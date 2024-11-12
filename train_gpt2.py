@@ -42,8 +42,8 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
         X = X.T
     for _ in range(steps):
         A = X @ X.T
-        B = A @ X
-        X = a * X + b * B + c * A @ B
+        B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        X = a * X + B @ X
     if G.size(0) > G.size(1):
         X = X.T
     return X
@@ -91,7 +91,6 @@ class Muon(torch.optim.Optimizer):
 
     def step(self):
       with torch.cuda.stream(self.stream):
-
           for group in self.param_groups:
               lr = group['lr']
               momentum = group['momentum']
@@ -154,7 +153,7 @@ class Muon(torch.optim.Optimizer):
 # PyTorch nn.Module definitions for the GPT-2 model
 
 class Rotary(torch.nn.Module):
-    def __init__(self, dim, base=10000, max_seq_len=2048):
+    def __init__(self, dim, base=10000, max_seq_len=1024):
         super().__init__()
         self.dim = dim
 
@@ -214,6 +213,7 @@ class CausalSelfAttention(nn.Module):
         if v1 is None:
             v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
         v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
+
         cos, sin = self.rotary(q)
         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
@@ -223,11 +223,12 @@ class CausalSelfAttention(nn.Module):
         return y, v1
 
 class MLP(nn.Module):
+
     def __init__(self, config):
         super().__init__()
-        hidden_dim   = int(config.n_embd * 11008/4096)
-        self.c_fc    = CastedLinear(config.n_embd, hidden_dim, bias=False)
-        self.c_proj  = CastedLinear(hidden_dim, config.n_embd, bias=False)
+        hidden_dim = int(8/3 * config.n_embd)
+        self.c_fc = CastedLinear(config.n_embd, hidden_dim, bias=False)
+        self.c_proj = CastedLinear(hidden_dim, config.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x):
@@ -237,6 +238,7 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
+
     def __init__(self, config):
         super().__init__()
         self.attn = CausalSelfAttention(config)
@@ -271,10 +273,9 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
 
-        self.num_layers = config.n_layer
-        self.encoder_layers = self.num_layers // 2  # Half of the layers for encoder
-        self.decoder_layers = self.num_layers - self.encoder_layers  # Remaining for decoder
-        
+        # U-net design by @brendanh0gan
+        self.encoder_layers = config.n_layer // 2 # Half of the layers for encoder
+        self.decoder_layers = config.n_layer - self.encoder_layers # Remaining for decoder
         # Add learnable skip connection weights for decoder layers
         self.skip_weights = nn.Parameter(torch.ones(self.decoder_layers))
 
@@ -291,22 +292,20 @@ class GPT(nn.Module):
 
         # Store outputs for U-Net skip connections
         skip_connections = []
-        
+
         # Encoder pass - process only the first half of the blocks
         for i in range(self.encoder_layers):
             x, v1 = self.transformer.h[i](x, v1, x0)
             skip_connections.append(x)  # Store the output for skip connections
-        
+
         # Decoder pass - process the remaining blocks with weighted skip connections
         for i in range(self.decoder_layers):
             skip_connection = skip_connections.pop()  # Get the corresponding encoder output
             # Apply learnable weight to skip connection
             weighted_skip = self.skip_weights[i] * skip_connection
             x, v1 = self.transformer.h[self.encoder_layers + i](x + weighted_skip, v1, x0)
-        
 
         x = F.rms_norm(x, (x.size(-1),))
-
         logits = self.lm_head(x)
         logits = 30 * torch.tanh(logits / 30) # @Grad62304977
         logits = logits.float()
@@ -379,7 +378,6 @@ class DistributedDataLoader:
             self.advance()
 
         return x, y
-
 
 # -----------------------------------------------------------------------------
 # int main
@@ -459,9 +457,9 @@ optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.6,   beta
 optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.008, betas=(0.9, 0.95), fused=True)
 params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
-scalar_params = [p for p in params if p.ndim < 2]
-optimizer3 = Muon(matrix_params, lr=0.02,  momentum=0.95)
-optimizer4 = torch.optim.Adam(list(scalar_params) + [raw_model.skip_weights], lr=0.04, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
+scalar_params = [p for p in params if p.ndim < 2]+[raw_model.skip_weights]
+optimizer3 = Muon(matrix_params, lr=0.04, momentum=0.95)
+optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
