@@ -74,49 +74,80 @@ class Muon(torch.optim.Optimizer):
         backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
         backend_steps: The number of iteration steps to use in the backend, if it is iterative.
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
-                 backend='newtonschulz5', backend_steps=5):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, backend='newtonschulz5', backend_steps=5):
+        defaults = dict(lr=lr, momentum=momentum, backend=backend,
+                       backend_steps=backend_steps, nesterov=nesterov)
         super().__init__(params, defaults)
 
+        self.world_size = int(os.environ['WORLD_SIZE'])
+        self.rank = int(os.environ['RANK'])
+
+        self.stream = torch.cuda.Stream()
+
+        max_size = max(sum(p.numel() for p in group['params']) for group in self.param_groups)
+
+        self.updates_buffer = torch.zeros(max_size, device='cuda', dtype=torch.bfloat16)
+
     def step(self):
+      with torch.cuda.stream(self.stream):
 
-        for group in self.param_groups:
+          for group in self.param_groups:
+              lr = group['lr']
+              momentum = group['momentum']
+              nesterov = group['nesterov']
+              zeropower_backend = zeropower_backends[group['backend']]
+              backend_steps = group['backend_steps']
 
-            lr = group['lr']
-            momentum = group['momentum']
-            zeropower_backend = zeropower_backends[group['backend']]
+              total_params = sum(p.numel() for p in group['params'])
+              updates_flat = self.updates_buffer[:total_params].zero_()
 
-            # generate weight updates in distributed fashion
-            total_params = sum(p.numel() for p in group['params'])
-            updates_flat = torch.zeros(total_params, device='cuda', dtype=torch.bfloat16)
-            curr_idx = 0
-            for i, p in enumerate(group['params']):
-                # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
-                if i % int(os.environ['WORLD_SIZE']) == int(os.environ['RANK']):
-                    g = p.grad
-                    assert g is not None
-                    state = self.state[p]
-                    if 'momentum_buffer' not in state:
-                        state['momentum_buffer'] = torch.zeros_like(g)
-                    buf = state['momentum_buffer']
-                    buf.mul_(momentum).add_(g)
-                    if group['nesterov']:
-                        g = g.add(buf, alpha=momentum)
-                    g = zeropower_backend(g, steps=group['backend_steps'])
-                    g *= max(1, g.size(0)/g.size(1))**0.5
-                    updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
-                curr_idx += p.numel()
+              curr_idx = 0
 
-            # sync updates across devices. we are not memory-constrained so can do this simple deserialization
-            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+              parameters, gradients = [], []
+              buffers, inds = [], []
 
-            # deserialize and apply updates
-            curr_idx = 0
-            for p in group['params']:
-                g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
-                p.data.add_(g, alpha=-lr)
-                curr_idx += p.numel()
+              for i, p in enumerate(group['params']):
+                  if i % self.world_size == self.rank and p.grad is not None:
+                      parameters.append(p)
+                      gradients.append(p.grad)
+
+                      state = self.state[p]
+                      if 'momentum_buffer' not in state:
+                          state['momentum_buffer'] = torch.zeros_like(p.grad)
+                      buffers.append(state['momentum_buffer'])
+                      inds.append(curr_idx)
+                  curr_idx += p.numel()
+
+              if parameters:
+                  torch._foreach_mul_(buffers, momentum)
+                  torch._foreach_add_(buffers, gradients)
+
+                  if nesterov:
+                      gradients = torch._foreach_add(gradients, buffers, alpha=momentum)
+
+                  for g, idx in zip(gradients, inds):
+                      processed_g = zeropower_backend(g, steps=backend_steps)
+                      processed_g *= max(1, g.size(0)/g.size(1))**0.5
+                      updates_flat[idx:idx + g.numel()].copy_(processed_g.flatten())
+
+              future = dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM, async_op=True)
+
+              param_views = []
+              curr_idx = 0
+              for p in group['params']:
+                  numel = p.numel()
+                  param_views.append((
+                      p,
+                      updates_flat[curr_idx:curr_idx + numel].view_as(p.data)
+                  ))
+                  curr_idx += numel
+
+              future.wait()
+
+              for p, view in param_views:
+                  p.data.add_(view.to(p.dtype), alpha=-lr)
+
+              self.stream.synchronize()
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
