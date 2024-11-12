@@ -177,8 +177,7 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x, v1=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        qkv = self.c_qkv(x)
-        qkv = self.qkv_proj(x).view(B, T, 3, self.n_head, self.head_dim)
+        qkv = self.c_qkv(x).view(B, T, 3, self.n_head, self.head_dim)
         q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
 
         if v1 is None:
