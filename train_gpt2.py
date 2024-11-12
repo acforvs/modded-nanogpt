@@ -152,9 +152,75 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3).type_as(x)
 
-class CastedLinear(nn.Linear):
-    def forward(self, x):
-        return F.linear(x, self.weight.to(x.dtype))
+
+# BASED ON https://github.com/facebookresearch/lingua/blob/main/lingua/float8.py
+EPS = 1e-12
+
+def scale(t, amax_t, dtype_t):
+    min_v, max_v = torch.finfo(dtype_t).min, torch.finfo(dtype_t).max
+    scale_t = torch.clamp(amax_t.float(), min=EPS) / max_v
+    t_fp8 = (t / scale_t).clamp(min=min_v, max=max_v).to(dtype_t)
+    return t_fp8, scale_t
+
+
+def matmul(first, amax_first, dtype_first, second_t, amax_second_t, dtype_second_t, bias):
+    first_fp8, scale_first = scale(first, amax_first, dtype_first)
+    second_t_fp8, scale_second_t = scale(second_t, amax_second_t, dtype_second_t)
+    output = torch._scaled_mm(
+        first_fp8,
+        second_t_fp8.t(),
+        scale_a=scale_first,
+        scale_b=scale_second_t.t(),
+        bias=bias,
+        out_dtype=torch.bfloat16,
+        use_fast_accum=True,
+    )
+    return output
+
+
+@torch._dynamo.allow_in_graph
+class Fp8LinearFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, a, b_t, bias):
+        amax_a = a.abs().amax(dim=-1, keepdim=True)
+        amax_b_t = b_t.abs().amax(dim=-1, keepdim=True)
+        out = matmul(a, amax_a, torch.float8_e4m3fn, b_t, amax_b_t, torch.float8_e4m3fn, bias)
+
+        ctx.a_requires_grad = a.requires_grad
+        ctx.b_requires_grad = b_t.requires_grad
+        ctx.bias_requires_grad = bias.requires_grad if bias is not None else False
+
+        ctx.save_for_backward(a, b_t, amax_b_t.max())
+
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        a, b_t, amax_b = ctx.saved_tensors
+
+        if ctx.a_requires_grad:
+            b = b_t.t().contiguous()
+            amax_grad_out = grad_out.abs().amax(dim=-1, keepdim=True)
+            amax_b = amax_b.repeat(b.shape[0], 1)
+            grad_a = matmul(grad_out, amax_grad_out, torch.float8_e4m3fn, b, amax_b, torch.float8_e4m3fn, None)
+        else:
+            grad_a = None
+        if ctx.b_requires_grad:
+            grad_b = grad_out.t() @ a
+        else:
+            grad_b = None
+        if ctx.bias_requires_grad:
+            grad_bias = grad_out.sum(dim=0)
+        else:
+            grad_bias = None
+
+        return grad_a, grad_b, grad_bias
+
+class CastedLinear(torch.nn.Linear):
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        out = Fp8LinearFn.apply(input.flatten(end_dim=-2), self.weight, self.bias)
+        out = out.unflatten(0, input.shape[:-1])
+        return out
 
 class CausalSelfAttention(nn.Module):
 
