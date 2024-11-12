@@ -308,6 +308,7 @@ class DistributedDataLoader:
 
     def advance(self):
         self.tokens = self.future.result()
+        self.current_shard = (self.current_shard + 1) % len(self.files)
         self.current_position = self.process_rank * self.B * self.T
         self._prefetch_next()
 
