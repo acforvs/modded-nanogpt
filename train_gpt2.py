@@ -570,35 +570,31 @@ for step in range(args.num_iterations + 1):
             for p in model.parameters():
                 p.grad /= train_accumulation_steps
 
-    # momentum warmup for Muon
-    with record_function("momentum_update"):
-        frac = min(step/500, 1)
-        optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+        # momentum warmup for Muon
+        with record_function("momentum_update"):
+            frac = min(step/500, 1)
+            optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
 
-    # step the optimizers and schedulers
-    with record_function("optimizer_step"):
-        for opt, sched in zip(optimizers, schedulers):
-            opt.step()
-            sched.step()
+        # step the optimizers and schedulers
+        with record_function("optimizer_step"):
+            for opt, sched in zip(optimizers, schedulers):
+                opt.step()
+                sched.step()
 
-    # null the gradients
-    with record_function("zero_grad"):
-        model.zero_grad(set_to_none=True)
+        # null the gradients
+        with record_function("zero_grad"):
+            model.zero_grad(set_to_none=True)
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
 
     #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
-    if master_process:
-        approx_time = training_time_ms + 1000 * (time.time() - t0)
-        print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
-        with open(logfile, "a") as f:
-            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+        if master_process:
+            approx_time = training_time_ms + 1000 * (time.time() - t0)
+            print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+            with open(logfile, "a") as f:
+                f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
 
-        with open(logfile, "a") as f:
-            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
-            f.write(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-
-        prof.step()
+            prof.step()
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
