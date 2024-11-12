@@ -364,7 +364,7 @@ class Hyperparameters:
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 3000 # number of iterations to run
+    num_iterations : int = 50 # number of iterations to run
     warmup_iters : int = 0
     warmdown_iters : int = 900 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
@@ -469,11 +469,7 @@ if master_process:
         f.write(f'{result.stdout}\n')
         f.write('='*100 + '\n')
 
-sort_by_keyword = "self_" + device + "_time_total"
-
 def trace_handler(p):
-    output = p.key_averages().table(sort_by=sort_by_keyword, row_limit=10)
-    print(output)
     p.export_chrome_trace("/tmp/trace_" + str(p.step_num) + ".json")
 
 def get_profiler():
