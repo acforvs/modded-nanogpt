@@ -122,26 +122,28 @@ class Muon(torch.optim.Optimizer):
 # PyTorch nn.Module definitions for the GPT-2 model
 
 class Rotary(torch.nn.Module):
-
-    def __init__(self, dim, base=10000):
+    def __init__(self, dim, base=10000, max_seq_len=2048):
         super().__init__()
         self.dim = dim
-        self.base = base
-        self.inv_freq = None
-        self.seq_len_cached = None
-        self.cos_cached = None
-        self.sin_cached = None
+
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq)
+
+        pos = torch.arange(max_seq_len)
+        freqs = torch.outer(pos, self.inv_freq)
+
+        cos = freqs.cos().bfloat16()
+        sin = freqs.sin().bfloat16()
+
+        self.register_buffer('cos_cached', cos.unsqueeze(0).unsqueeze(2))
+        self.register_buffer('sin_cached', sin.unsqueeze(0).unsqueeze(2))
 
     def forward(self, x):
         seq_len = x.shape[1]
-        if seq_len != self.seq_len_cached:
-            self.inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, device=x.device).float() / self.dim))
-            self.seq_len_cached = seq_len
-            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
-            freqs = torch.outer(t, self.inv_freq)
-            self.cos_cached = freqs.cos().bfloat16()
-            self.sin_cached = freqs.sin().bfloat16()
-        return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
+        return (
+            self.cos_cached[:, :seq_len],
+            self.sin_cached[:, :seq_len]
+        )
 
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4 # multihead attention
@@ -164,20 +166,21 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
-        self.c_q = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        self.c_k = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        self.c_v = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_qkv = CastedLinear(self.n_embd, 3 * self.n_embd, bias=False)
+
         # output projection
         self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
-        self.rotary = Rotary(self.head_dim)
+
+        self.rotary = Rotary(self.head_dim, config.m)
         self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
 
     def forward(self, x, v1=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
+        qkv = self.c_qkv(x)
+        qkv = self.qkv_proj(x).view(B, T, 3, self.n_head, self.head_dim)
+        q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+
         if v1 is None:
             v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
         v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
