@@ -16,6 +16,10 @@ import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 # Use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+
+from liger_kernel.transformers import liger_rotary_pos_emb, LigerGEGLUMLP, LigerRMSNorm
+
+
 flex_attention = torch.compile(flex_attention, dynamic=False)
 create_block_mask = torch.compile(create_block_mask, dynamic=False)
 
@@ -147,15 +151,6 @@ class Rotary(torch.nn.Module):
             self.sin_cached = freqs.sin().bfloat16()
         return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
 
-def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 4 # multihead attention
-    d = x.shape[3]//2
-    x1 = x[..., :d]
-    x2 = x[..., d:]
-    y1 = x1 * cos + x2 * sin
-    y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3).type_as(x)
-
 class CastedLinear(nn.Linear):
     def forward(self, x):
         return F.linear(x, self.weight.to(x.dtype))
@@ -164,63 +159,88 @@ class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.n_head = config.n_head
         self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
-        assert self.n_embd % self.n_head == 0
+        self.n_query_heads = config.n_head
+        self.n_kv_heads = config.n_kv_head
+        assert self.n_embd % self.n_query_heads == 0
+        assert self.n_query_heads % self.n_kv_heads == 0
+
+        self.n_groups = self.n_query_heads // self.n_kv_heads
+        self.head_dim = self.n_embd // self.n_query_heads
+
         self.c_q = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        self.c_k = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        self.c_v = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        kv_dim = self.head_dim * self.n_kv_heads
+        self.c_k = CastedLinear(self.n_embd, kv_dim, bias=False)
+        self.c_v = CastedLinear(self.n_embd, kv_dim, bias=False)
+
         # output projection
         self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+
+        torch.nn.init.normal_(self.c_k.weight, mean=0.0, std=0.02)
+        torch.nn.init.normal_(self.c_v.weight, mean=0.0, std=0.02)
+
         self.rotary = Rotary(self.head_dim)
         self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
 
     def forward(self, x, v1, block_mask):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
+        q = self.c_q(x).view(B, T, self.n_query_heads, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_kv_heads, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_kv_heads, self.head_dim)
+
+        k = k.repeat_interleave(self.n_groups, dim=2)
+        v = v.repeat_interleave(self.n_groups, dim=2)
         if v1 is None:
             v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
         v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
         cos, sin = self.rotary(q)
         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        q, k = liger_rotary_pos_emb(q, k, cos, sin)
+
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y, v1
 
-class MLP(nn.Module):
+@dataclass
+class LigerGEGLUMLPConfig:
+    hidden_size: int
+    intermediate_size: int
 
+class MLP(LigerGEGLUMLP):
     def __init__(self, config):
-        super().__init__()
-        self.c_fc    = CastedLinear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj  = CastedLinear(4 * config.n_embd, config.n_embd, bias=False)
-        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        x = self.c_proj(x)
-        return x
+        liger_config = LigerGEGLUMLPConfig(config.n_embd, int(8 / 3 * config.n_embd))
+        super().__init__(liger_config)
 
 class Block(nn.Module):
-
     def __init__(self, config):
         super().__init__()
         self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
+        self.input_layernorm = LigerRMSNorm(config.n_embd)
+        self.post_attention_layernorm = LigerRMSNorm(config.n_embd)
+        self.pre_mlp_layernorm = LigerRMSNorm(config.n_embd)
+        self.post_mlp_layernorm = LigerRMSNorm(config.n_embd)
+
     def forward(self, x, v1, x0, block_mask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x1, v1 = self.attn(F.rms_norm(x, (x.size(-1),)), v1, block_mask)
-        x = x + x1
-        x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
-        return x, v1
+
+        residual = x
+        x = self.input_layernorm(x)
+        x1, v1 = self.attn(x, v1, block_mask)
+        x1 = self.post_attention_layernorm(x1)
+        x = residual + x1
+
+        residual = x
+        x = self.pre_mlp_layernorm(x)
+        x = self.mlp(x)
+        x = self.post_mlp_layernorm(x)
+        x = residual + x
+
+        return x
 
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
@@ -229,7 +249,8 @@ class Block(nn.Module):
 class GPTConfig:
     vocab_size : int = 50304
     n_layer : int = 12
-    n_head : int = 6 # head dim 128 suggested by @Grad62304977
+    n_head : int = 12
+    n_kv_head : int = 3
     n_embd : int = 768
 
 class GPT(nn.Module):
@@ -370,9 +391,9 @@ class Hyperparameters:
     batch_size : int = 8 # batch size, in sequences, across all devices
     device_batch_size : int = 1 # batch size, in sequences, per device
     sequence_length : int = 64*1024 # sequence length, in tokens
-    num_iterations : int = 1875 # number of iterations to run
+    num_iterations : int = 2500 # number of iterations to run
     warmup_iters : int = 0
-    warmdown_iters : int = 562 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    warmdown_iters : int = 128 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -437,8 +458,7 @@ x, y = train_loader.next_batch()
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
-num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
+model = GPT(GPTConfig())
 model = model.cuda().bfloat16()
 for m in model.modules():
     if isinstance(m, CastedLinear):
