@@ -164,13 +164,20 @@ class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.n_head = config.n_head
         self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
-        assert self.n_embd % self.n_head == 0
+        self.n_query_heads = config.n_head
+        self.n_kv_heads = config.n_kv_head
+        assert self.n_embd % self.n_query_heads == 0
+        assert self.n_query_heads % self.n_kv_heads == 0
+
+        self.n_groups = self.n_query_heads // self.n_kv_heads
+        self.head_dim = self.n_embd // self.n_query_heads
+
         self.c_q = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        self.c_k = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        self.c_v = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        kv_dim = self.head_dim * self.n_kv_heads
+        self.c_k = CastedLinear(self.n_embd, kv_dim, bias=False)
+        self.c_v = CastedLinear(self.n_embd, kv_dim, bias=False)
+
         # output projection
         self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
@@ -179,9 +186,12 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x, v1, block_mask):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
+        q = self.c_q(x).view(B, T, self.n_query_heads, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_kv_heads, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_kv_heads, self.head_dim)
+
+        k = k.repeat_interleave(self.n_groups, dim=2)
+        v = v.repeat_interleave(self.n_groups, dim=2)
         if v1 is None:
             v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
         v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
@@ -229,7 +239,8 @@ class Block(nn.Module):
 class GPTConfig:
     vocab_size : int = 50304
     n_layer : int = 12
-    n_head : int = 6 # head dim 128 suggested by @Grad62304977
+    n_head : int = 8
+    n_kv_head : int = 2
     n_embd : int = 768
 
 class GPT(nn.Module):
@@ -438,7 +449,7 @@ x, y = train_loader.next_batch()
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
+model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12))
 model = model.cuda().bfloat16()
 for m in model.modules():
     if isinstance(m, CastedLinear):
