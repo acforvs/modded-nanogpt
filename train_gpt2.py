@@ -207,20 +207,48 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
-class Block(nn.Module):
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.zeros(dim))
 
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x.float())
+        output = output * (1.0 + self.weight.float())
+        return output.type_as(x)
+
+class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
+        self.input_layernorm = RMSNorm(config.n_embd)
+        self.post_attention_layernorm = RMSNorm(config.n_embd)
+        self.pre_mlp_layernorm = RMSNorm(config.n_embd)
+        self.post_mlp_layernorm = RMSNorm(config.n_embd)
+
     def forward(self, x, v1, x0, block_mask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x1, v1 = self.attn(F.rms_norm(x, (x.size(-1),)), v1, block_mask)
-        x = x + x1
-        x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
-        return x, v1
+
+        residual = x
+        x = self.input_layernorm(x)
+        x1, v1 = self.attn(x, v1, block_mask)
+        x1 = self.post_attention_layernorm(x1)
+        x = residual + x1
+
+        residual = x
+        x = self.pre_mlp_layernorm(x)
+        x = self.mlp(x)
+        x = self.post_mlp_layernorm(x)
+        x = residual + x
+
+        return x
 
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
