@@ -17,7 +17,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # Use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 
-from liger_kernel.transformers import liger_rotary_pos_emb, LigerGEGLUMLP, LigerRMSNorm
+from liger_kernel.transformers import LigerGEGLUMLP, LigerRMSNorm
 
 
 flex_attention = torch.compile(flex_attention, dynamic=False)
@@ -129,6 +129,7 @@ class Muon(torch.optim.Optimizer):
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
 
+
 class Rotary(torch.nn.Module):
 
     def __init__(self, dim, base=10000):
@@ -150,6 +151,15 @@ class Rotary(torch.nn.Module):
             self.cos_cached = freqs.cos().bfloat16()
             self.sin_cached = freqs.sin().bfloat16()
         return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
+
+def apply_rotary_emb(x, cos, sin):
+    assert x.ndim == 4 # multihead attention
+    d = x.shape[3]//2
+    x1 = x[..., :d]
+    x2 = x[..., d:]
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    return torch.cat([y1, y2], 3).type_as(x)
 
 class CastedLinear(nn.Linear):
     def forward(self, x):
@@ -196,7 +206,7 @@ class CausalSelfAttention(nn.Module):
         v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
         cos, sin = self.rotary(q)
         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
-        q, k = liger_rotary_pos_emb(q, k, cos, sin)
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
 
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
@@ -240,7 +250,7 @@ class Block(nn.Module):
         x = self.post_mlp_layernorm(x)
         x = residual + x
 
-        return x
+        return x, v1
 
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
