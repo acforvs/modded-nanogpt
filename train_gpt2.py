@@ -248,7 +248,7 @@ class Block(nn.Module):
         x = self.post_mlp_layernorm(x)
         x = residual + x
 
-        return x
+        return x, v1
 
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
