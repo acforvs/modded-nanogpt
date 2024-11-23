@@ -194,18 +194,19 @@ class CausalSelfAttention(nn.Module):
         return y, v1
 
 class MLP(nn.Module):
-
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = CastedLinear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj  = CastedLinear(4 * config.n_embd, config.n_embd, bias=False)
+        self.hidden_size = config.n_embd
+        self.intermediate_size = int(8 / 3 * config.n_embd)
+
+        self.gate_proj = CastedLinear(self.hidden_size, self.intermediate_size, bias=False)
+        self.c_fc = CastedLinear(self.hidden_size, self.intermediate_size, bias=False)
+        self.c_proj = CastedLinear(self.intermediate_size, self.hidden_size, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        x = self.c_proj(x)
-        return x
+        # squared relu : https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        return self.c_proj(F.relu(self.gate_proj(x)).square() * self.c_fc(x))
 
 class Block(nn.Module):
 
