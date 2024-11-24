@@ -176,10 +176,11 @@ class CausalSelfAttention(nn.Module):
         self.c_k = CastedLinear(self.n_embd, kv_dim, bias=False)
         self.c_v = CastedLinear(self.n_embd, kv_dim, bias=False)
 
-        self._init_weights()
-
         # output projection
         self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
+
+        self._init_weights()
+
         self.rotary = Rotary(self.head_dim)
         self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
 
