@@ -126,7 +126,6 @@ class Muon(torch.optim.Optimizer):
 # PyTorch nn.Module definitions for the GPT-2 model
 
 class Rotary(torch.nn.Module):
-
     def __init__(self, dim, base=10000):
         super().__init__()
         self.dim = dim
@@ -161,7 +160,6 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype))
 
 class CausalSelfAttention(nn.Module):
-
     def __init__(self, config):
         super().__init__()
         self.n_embd = config.n_embd
@@ -178,11 +176,20 @@ class CausalSelfAttention(nn.Module):
         self.c_k = CastedLinear(self.n_embd, kv_dim, bias=False)
         self.c_v = CastedLinear(self.n_embd, kv_dim, bias=False)
 
+        self._init_weights()
+
         # output projection
         self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
-        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
         self.rotary = Rotary(self.head_dim)
         self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
+
+    def _init_weights(self):
+        std = 0.02
+        for module in (self.c_q, self.c_k, self.c_v):
+            nn.init.normal_(module.weight, mean=0.0, std=std)
+
+        # zero init suggested by @Grad62304977
+        nn.init.zeros_(self.c_proj.weight)
 
     def forward(self, x, v1, block_mask):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -204,12 +211,16 @@ class CausalSelfAttention(nn.Module):
         return y, v1
 
 class MLP(nn.Module):
-
     def __init__(self, config):
         super().__init__()
         self.c_fc    = CastedLinear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj  = CastedLinear(4 * config.n_embd, config.n_embd, bias=False)
-        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.normal_(self.c_fc.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.c_proj.weight) # zero init suggested by @Grad62304977
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -218,7 +229,6 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-
     def __init__(self, config):
         super().__init__()
         self.attn = CausalSelfAttention(config)
@@ -238,13 +248,12 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     vocab_size : int = 50304
-    n_layer : int = 12
-    n_head : int = 8
-    n_kv_head : int = 2
-    n_embd : int = 768
+    n_layer : int = 28
+    n_head : int = 9
+    n_kv_head : int = 3
+    n_embd : int = 576
 
 class GPT(nn.Module):
-
     def __init__(self, config):
         super().__init__()
 
